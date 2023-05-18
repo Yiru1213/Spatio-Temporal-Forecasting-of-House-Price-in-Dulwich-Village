@@ -1,0 +1,342 @@
+---
+title: 'Forecasting House Price of Wards in the Borough of Southwark '
+author: "Yiru Xu"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data Preparation
+
+```{r load_packages,include=FALSE}
+library(sf)
+library(sp)
+library(dplyr)
+library(tmap)
+library(ggplot2)
+library(tseries)
+library(forecast)
+source('starima_package.R')
+library(spdep)
+library(knitr)
+library(reshape2)
+library(rgdal)
+```
+
+```{r feature_engineering, include=FALSE}
+# read the data
+london_house_price = read.csv('data/mhp_london_ward.csv')
+london_ward = st_read("data/London_Ward.shp")
+# remove unnecessary rows and columns
+london_house_price = london_house_price[-c(1,2,3,4),]
+london_ward = london_ward[, -c(5,6)]
+# change column names for the two data sets
+colnames(london_house_price) = london_house_price[1,]
+colnames(london_ward)[2] = london_house_price[1,3]
+# remove columns of 1995Dec, 2022Mar and 2022Jun 
+london_house_price = london_house_price[-1,-c(5,110:113)]
+# filter southwark wards and delete unnecessary columns
+southwark_ward = filter(london_ward, DISTRICT == 'Southwark')
+# filter southwark wards from the house price data
+southwark_house_price = 
+  london_house_price[london_house_price$`Ward code` %in% southwark_ward$`Ward code`, ]
+southwark_house_price = southwark_house_price[,-c(1,2)]
+# replace ":" into "0,000" - easier for transforming
+southwark_house_price[southwark_house_price == ':'] = '0,000'
+# change the house price data type into numeric
+southwark_house_price[, 3:ncol(southwark_house_price)] = 
+  apply(southwark_house_price[, 3:ncol(southwark_house_price)], 
+        2, function(x) as.numeric(gsub(",", "", x)))
+# aggregate house prices to wards geometry data
+sk_ward_hp = inner_join(southwark_ward, 
+                        southwark_house_price[, c(1,3:ncol(southwark_house_price))], by = c("Ward code" = "Ward code"))
+sk_ward_hp = sk_ward_hp[ , -c(2:4)]
+# change the column names 
+months = gsub('Year ending (\\w{3}) (\\d{4})', '\\1', 
+              colnames(sk_ward_hp)[2:(ncol(sk_ward_hp)-1)])
+years = gsub('Year ending (\\w{3}) (\\d{4})', '\\2', 
+             colnames(sk_ward_hp)[2:(ncol(sk_ward_hp)-1)])
+new_colnames = paste(months, as.character(years), sep = '-')
+colnames(sk_ward_hp)[2:(ncol(sk_ward_hp)-1)] = new_colnames
+```
+
+```{r convert_data, include=TRUE}
+# create a matrix for easier analysis
+sk_ward_hp_matrix = data.matrix(sk_ward_hp[2:(ncol(sk_ward_hp)-1)])
+sk_ward_hp_matrix = sk_ward_hp_matrix[, -105]
+# calculate the mean of each year
+# create an empty matrix to store the means
+sk_ward_yhp_matrix = matrix(0, nrow = nrow(sk_ward_hp_matrix), ncol = 26)
+# Loop over each row of the matrix and calculate the mean of every year
+for (i in 1:nrow(sk_ward_hp_matrix)) {
+  for (j in 1:26) {
+    sk_ward_yhp_matrix[i, j] = mean(sk_ward_hp_matrix[i, ((j-1)*4+1):(j*4)])
+  }
+}
+colnames(sk_ward_yhp_matrix) = c(1996:2021)
+# change yearly data to dataframe
+sk_ward_yhp = data.frame(sk_ward_yhp_matrix)
+colnames(sk_ward_yhp) = c(1996:2021)
+# add a ward code column for aggregation
+sk_ward_yhp[,27] = southwark_house_price['Ward code']
+# aggregate house prices to wards geometry data
+sk_ward_yhp = inner_join(southwark_ward, 
+                        sk_ward_yhp, by = c("Ward code" = "Ward code"))
+sk_ward_yhp = sk_ward_yhp[ , -c(2:4)]
+```
+
+```{r write_shp, include=TRUE}
+# Convert the seasonal data frame to an sf object
+southwark_hp = st_as_sf(sk_ward_hp, crs = 27700)
+# Write the sf object to a shapefile
+st_write(southwark_hp, "southwark_hp.shp")
+# Convert the yearl data frame to an sf object
+southwark_yhp = st_as_sf(sk_ward_yhp, crs = 27700)
+# Write the sf object to a shapefile
+st_write(southwark_yhp, "southwark_yhp.shp")
+```
+
+## ESTDA
+
+#### Non Spatio-temporal Characteristics
+
+```{r data_distribution, include=True}
+# statistic summary of southwark and dulwich village
+print(paste("Southwark mean house price:",mean(sk_ward_hp_matrix)))
+print(paste("Dulwich village mean house price:",mean(sk_ward_hp_matrix[3,])))
+print(paste("Southwark median house price:",median(sk_ward_hp_matrix)))
+print(paste("Dulwich village median house price:",median(sk_ward_hp_matrix[3,])))
+print(paste("Southwark house price standard deviation:",sd(sk_ward_hp_matrix)))
+print(paste("Dulwich village house price standard deviation:",median(sk_ward_hp_matrix[3,])))
+print(paste("Southwark house price(min):",min(sk_ward_hp_matrix)))
+print(paste("Dulwich village house price(min):",min(sk_ward_hp_matrix[3,])))
+print(paste("Southwark house price(max):",max(sk_ward_hp_matrix)))
+print(paste("Dulwich village house price(max):",max(sk_ward_hp_matrix[3,])))
+# distribution of all the wards
+par(mfrow=c(1,2))
+hist(sk_ward_hp_matrix, main = 'Southwark', xlab = 'House Price')
+mu = mean(sk_ward_hp_matrix)
+abline(v=mu, col='red')
+# distribution of Dulwich Village
+hist(sk_ward_hp_matrix[3,], main = 'Dulwich Village', xlab = 'House Price')
+mu = mean(sk_ward_hp_matrix[3,])
+abline(v=mu, col='red')
+```
+
+#### Temporal Characteristics
+
+```{r temporal_pattern,include = TRUE}
+# Reshape data from wide to long format
+sk_ward_long = tidyr::pivot_longer(sk_ward_hp, cols = 2:(ncol(sk_ward_hp)-1), 
+                             names_to = "Date", values_to = "Price")
+colnames(sk_ward_long)[1] = 'Ward'
+# change the Date column to 'Date" class for visualisation   
+sk_ward_long$Date = lubridate::dmy(paste0('30-',sk_ward_long$Date))
+# plot the temporal pattern
+ggplot(sk_ward_long,
+       aes(x = Date, y = Price, group = Ward, color= Ward)) + 
+  geom_line() + 
+  xlab('Time') +
+  ylab("House Price") + 
+  scale_x_date(limits = c(min(sk_ward_long$Date), max(sk_ward_long$Date)),
+               date_labels = "%Y", date_breaks = "1 year") + 
+  ggtitle('House Price of Wards in Southwark (1996-2021)')+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+  theme(plot.title = element_text(hjust = 0.5))
+# only for dulwich Village
+# change the data matrix into time series object
+dulvil_hp_ts = ts(sk_ward_hp_matrix[3,], start = c(1996, 1), end = c(2021, 4), frequency = 4)
+plot(dulvil_hp_ts, type = 'l', xlab = 'Time', ylab = 'House Price', main = 'House Price in Dulwich Village from 1996 to 2021')
+```
+
+```{r temproal_autocorrelation, include=TRUE}
+# acf and pacf
+par(mar = c(5, 4, 4, 5) + 0.1)
+acf(dulvil_hp_ts, lag.max = 36, xlab = 'Lag', ylab = 'ACF', main = 'ACF of Seasonal House Price in Dulwich Village')
+pacf(dulvil_hp_ts, lag.max = 36, xlab = 'Lag', ylab = 'PACF', main = 'PACF of Seasonal House Price in Dulwich Village')
+# scatter plot
+par(mfrow=c(2,4))
+lag.plot(dulvil_hp_ts, lags = 16, do.lines = FALSE)
+```
+
+#### Spatial Characteristics
+
+```{r mapping_data, include=TRUE}
+southwark_yhp_shp = st_read('southwark_yhp.shp')
+colnames(southwark_yhp_shp)[2:27]= c(1996:2021)
+for (j in 2:(ncol(southwark_yhp_shp)-1)) {
+  par(mfrow=c(4,6))
+  map = tm_shape(southwark_yhp_shp)+
+    tm_fill(colnames(southwark_yhp_shp)[j], style="jenks", palette="Purples")+
+    tm_borders("white")+
+    tm_compass(position=c("right","top"))+
+    tm_scale_bar()
+  print(map)
+} 
+```
+
+```{r spatial_autocorrelation, include=TRUE}
+# spatial autocorrelation in 26-year scale
+southwark_hp_shp = st_read('southwark_hp.shp')
+nb = poly2nb(southwark_hp_shp)
+lw = nb2listw(nb)
+sk_ward_hp_avg = rowMeans(sk_ward_hp_matrix)
+moran.test(sk_ward_hp_avg, listw=lw1)
+# spatial autocorrelation in 1-year scale
+for (m in 2:(ncol(southwark_yhp_shp)-1)) {
+  par(mfrow=c(4,6))
+  nb1 = poly2nb(southwark_yhp_shp)
+  lw1 = nb2listw(nb1)
+  sk_ward_yhp_avg = sk_ward_hp_matrix[,m]
+  print(moran.test(sk_ward_yhp_avg, listw=lw1))
+}
+```
+
+## Data Decomposition and Differencing
+
+```{r data_decomposition, include=TRUE}
+decomp <- decompose(dulvil_hp_ts, type="multiplicative")
+plot(decomp, type = 'l')
+```
+
+```{r differencing_acf_pacf, include = True}
+dulvil_hp_df = diff(dulvil_hp_ts, differences = 1)
+# Augmented Dickey-Fuller Test (ADF) for stationary
+adf.test(dulvil_hp_df)
+# differenced time series pattern
+plot(dulvil_hp_df, type = 'l', xlab = 'Time', ylab = 'House Price', main = 'House Price in Dulwich Village from 1996 to 2021(Differenced)')
+# check acf and pacf
+par(mfrow = c(1,2))
+par(mar = c(5, 4, 4, 5) + 0.1)
+acf(dulvil_hp_df, lag.max = 40, xlab = 'Lag', ylab = 'ACF', main = 'ACF of Differenced House Price in Dulwich Village')
+pacf(dulvil_hp_df, lag.max = 40, xlab = 'Lag', ylab = 'PACF', main = 'PACF of Differenced House Price in Dulwich Village')
+```
+
+```{r seasonal_differencing, include=TRUE}
+# seasonal differencing
+dulvil_hp_sdf = diff(dulvil_hp_df, differences = 1, lag = 8)
+# comparison between differenced and seasonal-differenced data 
+par(mar = c(5, 4, 4, 5) + 0.1)
+par(mfrow = c(1,2))
+# acf
+acf(dulvil_hp_df, lag.max = 40, xlab = 'Lag', ylab = 'ACF', main = 'Differenced')
+acf(dulvil_hp_sdf, lag.max = 40, xlab = 'Lag', ylab = 'ACF', main = 'Differenced + Seasonal Differenced')
+# pacf
+pacf(dulvil_hp_df, lag.max = 40, xlab = 'Lag', ylab = 'PACF', main = 'Differenced')
+pacf(dulvil_hp_sdf, lag.max = 40, xlab = 'Lag', ylab = 'PACF', main = 'Differenced+ Seasonal Differenced')
+par(mfrow = c(2,1))
+plot(dulvil_hp_sdf, type = 'l', main = 'Differenced Time Series')
+plot(dulvil_hp_df, type = 'l', main = 'Differenced + Seasonal Differenced Time Series')
+# Augmented Dickey-Fuller Test (ADF) for stationary in residuals
+random_no_na = na.omit(decomp$random)
+adf.test(random_no_na)
+```
+
+## Parameter Estimation (ACF & PACF Analysis)
+
+```{r order_selection, include=TRUE}
+par(mar = c(5, 4, 4, 5) + 0.1)
+acf(dulvil_hp_sdf, lag.max = 40, xlab = 'Lag', ylab = 'ACF', main = 'ACF of House Price in Dulwich Village (Differenced + Seasonal Differenced)')
+pacf(dulvil_hp_sdf, lag.max = 40, xlab = 'Lag', ylab = 'ACF', main = 'PACF of House Price in Dulwich Village (Differenced + Seasonal Differenced)')
+```
+
+## Model Fitting
+
+### ARIMA
+
+Dividing the data into training data(1996-2015) and testing data(2016-2021).
+
+```{r sarima_110110), include=TRUE}
+fit_ar = arima(dulvil_hp_ts[1:84],order=c(1,1,0), seasonal=list(order=c(1,1,0)
+,period=8))
+print(fit_ar)
+```
+
+```{r diagnostic, include=TRUE}
+# a diagnostic plot of the fitted model
+tsdiag(fit_ar)
+```
+
+```{r sarima_with_MA, include=TRUE}
+fit_ar = arima(dulvil_hp_ts[1:84],order=c(4,1,4), seasonal=list(order=c(1,1,0)
+,period=8))
+print(fit_ar)
+```
+
+```{r diagonostic, include=TRUE}
+# a diagnostic plot of the fitted model
+tsdiag(fit_ar)
+```
+
+```{r prediction, include=TRUE}
+# define a function to calculate NRMSE for prediction
+nrmse <- function(actual, predicted) {
+  rmse <- sqrt(mean((actual - predicted)^2))
+  range <- max(actual) - min(actual)
+  return(rmse / range)
+}
+pre_ar = predict(fit_ar, n.ahead=20)
+matplot(1:20,cbind(dulvil_hp_ts[85:104],pre_ar$pred),type="l",main=
+"SARIMA prediction effect", ylab = 'Time')
+NRMSE_fit = NRMSE(fit_ar$residuals, dulvil_hp_ts[1:84])
+print(paste('fit_NRMSE:',NRMSE_fit))
+NRMSE_pre = nrmse(dulvil_hp_ts[85:104],pre_ar$se)
+print(paste('pre_NRMSE:',NRMSE_pre))
+```
+
+## STARIMA
+
+## Building spatial weight matrix
+
+```{r spatial_weight_matrix, include=TRUE}
+Wmat <- listw2mat(lw)
+```
+
+## **Space-time Autocorrelation and partial autocorrelation analysis**
+
+```{r acf_pacf, include=TRUE}
+sk_ward_hp_tm = t(sk_ward_hp_matrix)
+stacf(sk_ward_hp_tm, Wmat, 40)
+stpacf(sk_ward_hp_tm, Wmat, 40)
+```
+
+```{r differencing, include=TRUE}
+# differencing the matrix
+sk_ward_hp_tmdf = diff(sk_ward_hp_tm, differences = 1)
+# change the spatial weight matrix to fit the differenced matrix
+stacf(sk_ward_hp_tmdf, Wmat, 40)
+stpacf(sk_ward_hp_tmdf, Wmat, 40)
+```
+
+## Model Fitting
+
+```{r starima, include=TRUE}
+W_fit = list(w1=Wmat)
+fit_star = starima_fit(sk_ward_hp_tm[1:84,],W_fit,p=1,d=1,q=0)
+```
+
+```{r diagnostic, include=TRUE}
+stacf(fit_star$RES,Wmat,40)
+```
+
+```{r residuals_hist,include=TRUE}
+hist(fit_star$RES[,3])
+```
+
+## Prediction
+
+```{r prediction, include=TRUE}
+pre_star = starima_pre(sk_ward_hp_tm[84:104,], model = fit_star)
+matplot(1:20,cbind(sk_ward_hp_tm[85:104,3],pre_star$PRE[,3]),type="l", main = 'STARIMA prediction effect')
+NRMSE_star_fit = NRMSE(fit_star$RES, dulvil_hp_ts[1:84])
+print(paste('stfit_NRMSE: ',NRMSE_star_fit))
+NRMSE_star_pre = nrmse(dulvil_hp_ts[85:104],pre_star$PRE)
+print(paste('stpre_NRMSE: ',NRMSE_star_pre))
+```
+
+## 
